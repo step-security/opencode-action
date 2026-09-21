@@ -1,0 +1,172 @@
+name: "opencode GitHub Action"
+description: "Run opencode in GitHub Actions workflows"
+branding:
+  icon: "code"
+  color: "orange"
+
+inputs:
+  model:
+    description: "Model to use"
+    required: true
+
+  agent:
+    description: "Agent to use. Must be a primary agent. Falls back to default_agent from config or 'build' if not found."
+    required: false
+
+  share:
+    description: "Share the opencode session (defaults to true for public repos)"
+    required: false
+
+  prompt:
+    description: "Custom prompt to override the default prompt"
+    required: false
+
+  use_github_token:
+    description: "Use GITHUB_TOKEN directly instead of OpenCode App token exchange. When true, skips OIDC and uses the GITHUB_TOKEN env var."
+    required: false
+    default: "false"
+
+  mentions:
+    description: "Comma-separated list of trigger phrases (case-insensitive). Defaults to '/opencode,/oc'"
+    required: false
+
+  variant:
+    description: "Model variant for provider-specific reasoning effort (e.g., high, max, minimal)"
+    required: false
+
+  oidc_base_url:
+    description: "Base URL for OIDC token exchange API. Only required when running a custom GitHub App install. Defaults to https://api.opencode.ai"
+    required: false
+
+runs:
+  using: "composite"
+  steps:
+    - name: Subscription check
+      env:
+        REPO_PRIVATE: ${{ github.event.repository.private }}
+      run: |
+        # validate subscription status
+        UPSTREAM="anomalyco/opencode"
+        ACTION_REPO="${GITHUB_ACTION_REPOSITORY:-}"
+        DOCS_URL="https://docs.stepsecurity.io/actions/stepsecurity-maintained-actions"
+
+        echo ""
+        echo -e "\033[1;36mStepSecurity Maintained Action\033[0m"
+        echo "Secure drop-in replacement for $UPSTREAM"
+        if [ "$REPO_PRIVATE" = "false" ]; then
+          echo -e "\033[32m✓ Free for public repositories\033[0m"
+        fi
+        echo -e "\033[36mLearn more:\033[0m $DOCS_URL"
+        echo ""
+
+        if [ "$REPO_PRIVATE" != "false" ]; then
+          SERVER_URL="${GITHUB_SERVER_URL:-https://github.com}"
+
+          if [ "$SERVER_URL" != "https://github.com" ]; then
+            BODY=$(printf '{"action":"%s","ghes_server":"%s"}' "$ACTION_REPO" "$SERVER_URL")
+          else
+            BODY=$(printf '{"action":"%s"}' "$ACTION_REPO")
+          fi
+
+          API_URL="https://agent.api.stepsecurity.io/v1/github/$GITHUB_REPOSITORY/actions/maintained-actions-subscription"
+
+          RESPONSE=$(curl --max-time 3 -s -w "%{http_code}" \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -d "$BODY" \
+            "$API_URL" -o /dev/null) && CURL_EXIT_CODE=0 || CURL_EXIT_CODE=$?
+
+          if [ $CURL_EXIT_CODE -ne 0 ]; then
+            echo "Timeout or API not reachable. Continuing to next step."
+          elif [ "$RESPONSE" = "403" ]; then
+            echo -e "::error::\033[1;31mThis action requires a StepSecurity subscription for private repositories.\033[0m"
+            echo -e "::error::\033[31mLearn how to enable a subscription: $DOCS_URL\033[0m"
+            exit 1
+          fi
+        fi
+      shell: bash
+
+    - name: Get opencode version
+      id: version
+      shell: bash
+      run: |
+        VERSION=$(curl -sf https://api.github.com/repos/anomalyco/opencode/releases/latest | jq -r '.tag_name // empty')
+        if [ -z "$VERSION" ]; then
+          echo "::error::Failed to fetch opencode version from GitHub API"
+          exit 1
+        fi
+        echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+    - name: Cache opencode
+      id: cache
+      uses: actions/cache@v6
+      with:
+        path: ~/.opencode/bin
+        key: opencode-${{ runner.os }}-${{ runner.arch }}-${{ steps.version.outputs.version }}
+
+    - name: Install opencode
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+        ARCH=$(uname -m)
+        case "$ARCH" in
+          x86_64)  ARCH="x64" ;;
+          aarch64|arm64) ARCH="arm64" ;;
+          *) echo "::error::Unsupported architecture: $ARCH"; exit 1 ;;
+        esac
+        case "$OS" in
+          linux)  EXT="tar.gz" ;;
+          darwin) EXT="zip" ;;
+          *) echo "::error::Unsupported OS: $OS"; exit 1 ;;
+        esac
+        VERSION="${{ steps.version.outputs.version }}"
+        ASSET="opencode-${OS}-${ARCH}.${EXT}"
+
+        DIGEST=$(curl -sf "https://api.github.com/repos/anomalyco/opencode/releases/tags/${VERSION}" \
+          | jq -r --arg name "$ASSET" '.assets[] | select(.name == $name) | .digest // empty')
+        if [ -z "$DIGEST" ]; then
+          echo "::error::Could not retrieve digest for ${ASSET} from GitHub API"
+          exit 1
+        fi
+        EXPECTED_SHA256="${DIGEST#sha256:}"
+
+        DOWNLOAD_URL="https://github.com/anomalyco/opencode/releases/download/${VERSION}/${ASSET}"
+        echo "Downloading ${DOWNLOAD_URL}"
+        curl -fsSL "$DOWNLOAD_URL" -o opencode_asset
+
+        echo "${EXPECTED_SHA256}  opencode_asset" | sha256sum --check --strict
+        echo "Checksum verified"
+
+        EXTRACT_DIR=$(mktemp -d)
+        case "$EXT" in
+          tar.gz) tar -xzf opencode_asset -C "$EXTRACT_DIR" ;;
+          zip)    unzip -o opencode_asset -d "$EXTRACT_DIR" ;;
+        esac
+        BINARY=$(find "$EXTRACT_DIR" -name "opencode" -type f | head -1)
+        if [ -z "$BINARY" ]; then
+          echo "::error::Could not find opencode binary after extraction"
+          exit 1
+        fi
+        mkdir -p ~/.opencode/bin
+        mv "$BINARY" ~/.opencode/bin/opencode
+        chmod +x ~/.opencode/bin/opencode
+        rm -rf "$EXTRACT_DIR" opencode_asset
+
+    - name: Add opencode to PATH
+      shell: bash
+      run: echo "$HOME/.opencode/bin" >> $GITHUB_PATH
+
+    - name: Run opencode
+      shell: bash
+      id: run_opencode
+      run: opencode github run
+      env:
+        MODEL: ${{ inputs.model }}
+        AGENT: ${{ inputs.agent }}
+        SHARE: ${{ inputs.share }}
+        PROMPT: ${{ inputs.prompt }}
+        USE_GITHUB_TOKEN: ${{ inputs.use_github_token }}
+        MENTIONS: ${{ inputs.mentions }}
+        VARIANT: ${{ inputs.variant }}
+        OIDC_BASE_URL: ${{ inputs.oidc_base_url }}
